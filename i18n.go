@@ -7,15 +7,11 @@ import (
 	"io/ioutil"
 	"net/http"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 
-	"github.com/qor/admin"
 	"github.com/qor/cache"
 	"github.com/qor/cache/memory"
 	"github.com/qor/qor"
-	"github.com/qor/qor/resource"
 	"github.com/qor/qor/utils"
 	"github.com/theplant/cldr"
 )
@@ -25,7 +21,6 @@ var Default = "en-US"
 
 // I18n struct that hold all translations
 type I18n struct {
-	Resource        *admin.Resource
 	scope           string
 	value           string
 	Backends        []Backend
@@ -117,21 +112,6 @@ func (i18n *I18n) DeleteTranslation(translation *Translation) (err error) {
 	}
 
 	return i18n.cacheStore.Delete(cacheKey(translation.Locale, translation.Key))
-}
-
-// Scope i18n scope
-func (i18n *I18n) Scope(scope string) admin.I18n {
-	return &I18n{cacheStore: i18n.cacheStore, scope: scope, value: i18n.value, Backends: i18n.Backends, Resource: i18n.Resource, FallbackLocales: i18n.FallbackLocales, fallbackLocales: i18n.fallbackLocales}
-}
-
-// Default default value of translation if key is missing
-func (i18n *I18n) Default(value string) admin.I18n {
-	return &I18n{cacheStore: i18n.cacheStore, scope: i18n.scope, value: value, Backends: i18n.Backends, Resource: i18n.Resource, FallbackLocales: i18n.FallbackLocales, fallbackLocales: i18n.fallbackLocales}
-}
-
-// Fallbacks fallback to locale if translation doesn't exist in specified locale
-func (i18n *I18n) Fallbacks(locale ...string) admin.I18n {
-	return &I18n{cacheStore: i18n.cacheStore, scope: i18n.scope, value: i18n.value, Backends: i18n.Backends, Resource: i18n.Resource, FallbackLocales: i18n.FallbackLocales, fallbackLocales: locale}
 }
 
 // T translate with locale, key and arguments
@@ -272,145 +252,6 @@ func getEditableLocales(req *http.Request, currentUser qor.CurrentUser) []string
 		return user.AvailableLocales()
 	}
 	return []string{Default}
-}
-
-// ConfigureQorResource configure qor resource for qor admin
-func (i18n *I18n) ConfigureQorResource(res resource.Resourcer) {
-	if res, ok := res.(*admin.Resource); ok {
-		i18n.Resource = res
-		res.UseTheme("i18n")
-		res.GetAdmin().I18n = i18n
-		res.SearchAttrs("value") // generate search handler for i18n
-
-		var getPrimaryLocale = func(context *admin.Context) string {
-			if locale := context.Request.Form.Get("primary_locale"); locale != "" {
-				return locale
-			}
-			if availableLocales := getAvailableLocales(context.Request, context.CurrentUser); len(availableLocales) > 0 {
-				return availableLocales[0]
-			}
-			return ""
-		}
-
-		var getEditingLocale = func(context *admin.Context) string {
-			if locale := context.Request.Form.Get("to_locale"); locale != "" {
-				return locale
-			}
-			return getLocaleFromContext(context.Context)
-		}
-
-		type matchedTranslation struct {
-			Key           string
-			PrimaryLocale string
-			PrimaryValue  string
-			EditingLocale string
-			EditingValue  string
-		}
-
-		res.GetAdmin().RegisterFuncMap("i18n_available_translations", func(context *admin.Context) (results []matchedTranslation) {
-			var (
-				translationsMap     = i18n.LoadTranslations()
-				matchedTranslations = map[string]matchedTranslation{}
-				keys                = []string{}
-				keyword             = strings.ToLower(context.Request.URL.Query().Get("keyword"))
-				primaryLocale       = getPrimaryLocale(context)
-				editingLocale       = getEditingLocale(context)
-			)
-
-			var filterTranslations = func(translations map[string]*Translation, isPrimary bool) {
-				if translations != nil {
-					for key, translation := range translations {
-						if (keyword == "") || (strings.Index(strings.ToLower(translation.Key), keyword) != -1 ||
-							strings.Index(strings.ToLower(translation.Value), keyword) != -1) {
-							if _, ok := matchedTranslations[key]; !ok {
-								var t = matchedTranslation{
-									Key:           key,
-									PrimaryLocale: primaryLocale,
-									EditingLocale: editingLocale,
-									EditingValue:  translation.Value,
-								}
-
-								if localeTranslations, ok := translationsMap[primaryLocale]; ok {
-									if v, ok := localeTranslations[key]; ok {
-										t.PrimaryValue = v.Value
-									}
-								}
-
-								matchedTranslations[key] = t
-								keys = append(keys, key)
-							}
-						}
-					}
-				}
-			}
-
-			filterTranslations(translationsMap[getEditingLocale(context)], false)
-			if primaryLocale != editingLocale {
-				filterTranslations(translationsMap[getPrimaryLocale(context)], true)
-			}
-
-			sort.Strings(keys)
-
-			pagination := context.Searcher.Pagination
-			pagination.Total = len(keys)
-			pagination.PerPage, _ = strconv.Atoi(context.Request.URL.Query().Get("per_page"))
-			pagination.CurrentPage, _ = strconv.Atoi(context.Request.URL.Query().Get("page"))
-
-			if pagination.CurrentPage == 0 {
-				pagination.CurrentPage = 1
-			}
-
-			if pagination.PerPage == 0 {
-				pagination.PerPage = 25
-			}
-
-			if pagination.CurrentPage > 0 {
-				pagination.Pages = pagination.Total / pagination.PerPage
-			}
-
-			context.Searcher.Pagination = pagination
-
-			var paginationKeys []string
-			if pagination.CurrentPage == -1 {
-				paginationKeys = keys
-			} else {
-				lastIndex := pagination.CurrentPage * pagination.PerPage
-				if pagination.Total < lastIndex {
-					lastIndex = pagination.Total
-				}
-
-				startIndex := (pagination.CurrentPage - 1) * pagination.PerPage
-				if lastIndex >= startIndex {
-					paginationKeys = keys[startIndex:lastIndex]
-				}
-			}
-
-			for _, key := range paginationKeys {
-				results = append(results, matchedTranslations[key])
-			}
-			return results
-		})
-
-		res.GetAdmin().RegisterFuncMap("i18n_primary_locale", getPrimaryLocale)
-
-		res.GetAdmin().RegisterFuncMap("i18n_editing_locale", getEditingLocale)
-
-		res.GetAdmin().RegisterFuncMap("i18n_viewable_locales", func(context admin.Context) []string {
-			return getAvailableLocales(context.Request, context.CurrentUser)
-		})
-
-		res.GetAdmin().RegisterFuncMap("i18n_editable_locales", func(context admin.Context) []string {
-			return getEditableLocales(context.Request, context.CurrentUser)
-		})
-
-		controller := i18nController{i18n}
-		router := res.GetAdmin().GetRouter()
-		router.Get(res.ToParam(), controller.Index, &admin.RouteConfig{Resource: res})
-		router.Post(res.ToParam(), controller.Update, &admin.RouteConfig{Resource: res})
-		router.Put(res.ToParam(), controller.Update, &admin.RouteConfig{Resource: res})
-
-		res.GetAdmin().RegisterViewPath("github.com/qor/i18n/views")
-	}
 }
 
 func cacheKey(strs ...string) string {
